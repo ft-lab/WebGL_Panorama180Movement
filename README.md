@@ -66,7 +66,7 @@ Panoramic images as resources are output using the following assets of Unity Ass
 - Asia-Pacific Common Residential Theme Pack    
 https://assetstore.unity.com/packages/templates/packs/asia-pacific-common-residential-theme-pack-135233
 
-- Panorama180 Render
+- Panorama180 Render    
 https://assetstore.unity.com/packages/tools/utilities/panorama180-render-141234
 
 I used "Asia-Pacific Common Residential Theme Pack" as a rendering scene of panorama images.    

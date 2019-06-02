@@ -66,7 +66,7 @@ exr読み込みだとテクスチャ作成までに時間がかかったため�
 - Asia-Pacific Common Residential Theme Pack    
 https://assetstore.unity.com/packages/templates/packs/asia-pacific-common-residential-theme-pack-135233
 
-- Panorama180 Render
+- Panorama180 Render    
 https://assetstore.unity.com/packages/tools/utilities/panorama180-render-141234
 
 パノラマ画像のレンダリングシーンとして、"Asia-Pacific Common Residential Theme Pack"を使用しました。    
