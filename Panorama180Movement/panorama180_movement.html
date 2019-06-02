@@ -1,0 +1,954 @@
+<!--
+	Create a slightly movable space by using multiple 180 degree panoramic images.
+-->
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>Panorama180 Movement</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+		<style>
+			body {
+				font-family: Monospace;
+				background-color: #f0f0f0;
+				margin: 0px;
+				overflow: hidden;
+			}
+			#info {
+				position: absolute;
+				top: 16px;
+				left: 16px;
+				width: 100%;
+				color: #ffffff;
+				text-align: left;
+			}
+			a {
+				color: #ff0
+			}
+		</style>
+	</head>
+	<body>
+		<div id="container"></div>
+		<div id="container_hidden"></div>
+		<div id="info"></div>
+
+		<script src="../threejs/build/three.min.js"></script>
+		<script src="../threejs/vr/WebVR.js"></script>
+		<script src="../threejs/loaders/GLTFLoader.js"></script>	
+		<script src="../threejs/loaders/EXRLoader.js"></script>
+		<script src="../threejs/loaders/RGBELoader.js"></script>
+
+		<script src="mathutil.js"></script>	
+
+		<!-- ---------------------------------    -->
+		<!-- Depth blur Shader (post processing)  -->
+		<!-- ---------------------------------    -->
+		<script id="vs-depth-blur" type="x-shader/x-vertex">
+			varying vec2 vUv;
+
+			void main()	{
+				vUv = uv;
+				gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+			}
+		</script>
+
+		<script id="fs-depth-blur" type="x-shader/x-fragment">
+			varying vec2 vUv;
+			const float MIN_1PIXEL_VAL = 1.0 / 256.0;
+			uniform sampler2D _MainTex;       	// Texture.
+			uniform float _TextureWidth;		// Texture width.
+			uniform float _TextureHeight;		// Texture height.
+
+			void main()	{
+				vec2 uv = vUv;
+
+				float xD = 1.0 / _TextureWidth;
+				float yD = 1.0 / _TextureHeight;
+
+				float depth = texture2D(_MainTex, uv).x;
+
+				// Correction for hdr (For some reason, the distant place is 0.5 ?).
+				if (depth > 0.5 - MIN_1PIXEL_VAL && depth < 0.5 + MIN_1PIXEL_VAL) depth = 1.0;
+
+				float depth2;
+
+				vec2 uvP = vec2(xD, yD);
+				for (int i = 0; i < 3; ++i) {
+					{
+						depth2 = texture2D(_MainTex, vec2(min(1.0, uv.x + uvP.x), uv.y)).x;
+						if (depth2 > 0.5 - MIN_1PIXEL_VAL && depth2 < 0.5 + MIN_1PIXEL_VAL) depth2 = 1.0;
+
+						depth = min(depth, depth2);
+					}
+					{
+						depth2 = texture2D(_MainTex, vec2(max(0.0, uv.x - uvP.x), uv.y)).x;
+						if (depth2 > 0.5 - MIN_1PIXEL_VAL && depth2 < 0.5 + MIN_1PIXEL_VAL) depth2 = 1.0;
+
+						depth = min(depth, depth2);
+					}
+					{
+						depth2 = texture2D(_MainTex, vec2(uv.x, min(1.0, uv.y + uvP.y))).x;
+						if (depth2 > 0.5 - MIN_1PIXEL_VAL && depth2 < 0.5 + MIN_1PIXEL_VAL) depth2 = 1.0;
+
+						depth = min(depth, depth2);
+					}
+					{
+						depth2 = texture2D(_MainTex, vec2(uv.x, max(0.0, uv.y - uvP.y))).x;
+						if (depth2 > 0.5 - MIN_1PIXEL_VAL && depth2 < 0.5 + MIN_1PIXEL_VAL) depth2 = 1.0;
+
+						depth = min(depth, depth2);
+					}
+
+					uvP.x += xD;
+					uvP.y += yD;
+				}
+
+				gl_FragColor = vec4(depth, depth, depth, 1.0);
+			}
+		</script>
+
+		<!-- --------------------------------- -->
+		<!-- panoramaSphereRendering Shader    -->
+		<!-- --------------------------------- -->
+		<script id="vs-panoramaSphereRendering" type="x-shader/x-vertex">
+			varying vec2 vUv;
+
+			void main()	{
+				vUv = uv;
+				gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+			}
+		</script>
+
+		<script id="fs-panoramaSphereRendering" type="x-shader/x-fragment">
+			varying vec2 vUv;
+
+			const float PI = 3.1415926535;
+			const float PI2 = PI * 2.0;
+			const float MIN_VAL = (1e-5);
+			const float F_ONE_MIN = 0.99999;
+
+			// Panorama180 texture for sampling.
+			uniform sampler2D _Tex1;					// Texture at start position.
+			uniform sampler2D _Tex2;					// Texture at end position
+			uniform sampler2D _TexDepth1;				// Depth texture at start position.
+			uniform sampler2D _TexDepth2;				// Depth texture at end position.
+
+			uniform float _Intensity;					// Brightness of panoramic image.
+
+			uniform vec4 _Pos1;							// Camera start position.
+			uniform vec4 _Pos2;							// Camera end position.
+
+			uniform float _BlendV;						// Blend value of 2 images (_Tex1 to _Tex2).
+
+			uniform float _DepthTextureWidth;			// depth texture width.
+			uniform float _DepthTextureHeight;			// depth texture height.
+			uniform int _SpatialInterpolation;			// Whether to do spatial interpolation.
+			uniform int _ShowDepth;						// Display depth.
+
+			uniform float _CameraNearPlane;				// Near clip plane of the camera.
+			uniform float _CameraFarPlane;				// Far clip plane of the camera.
+
+			/**
+			 * Calculate UV Position on Texture.
+			 */
+ 			vec2 calcUV (vec2 _uv, int leftEye) {
+				vec2 uv = _uv;
+
+				if (leftEye == 0) {
+					uv.x += 0.5;
+				}
+				return uv;
+			}
+
+			/**
+			 * Convert UVs with SBS to UVs as a standalone panorama.
+			 */
+			vec2 calcUVInv (vec2 _uv, int leftEye) {
+				vec2 uv = _uv;
+				if (leftEye == 0) {
+					uv.x -= 0.5;
+				}
+				return uv;
+			}
+
+			/**
+			 * Calc gaze vector.
+			 */
+			vec3 calcVDir (vec2 _uv) {
+				float theta = PI2 * (_uv.x - 0.25);
+				float phi   = PI * (_uv.y - 0.5);
+				float sinP = sin(phi);
+				float cosP = cos(phi);
+				float sinT = sin(theta);
+				float cosT = cos(theta);
+				return vec3(cosP * sinT, sinP, -cosP * cosT);
+			}
+
+			/**
+			 * Calculate UV from world coordinates.
+			 */
+			vec2 calcWPosToUV (vec3 wPos, vec3 centerPos, int leftEye) {
+				vec3 vDir = normalize(wPos - centerPos);
+				vDir.z = -vDir.z;
+				float sinP = vDir.y;
+				float phi = asin(sinP);		// -90 ～ + 90の範囲.
+				float cosP = cos(phi);
+				if (abs(cosP) < 1e-5) cosP = 1e-5;
+				float sinT = vDir.x / cosP;
+				float cosT = vDir.z / cosP;
+				sinT = max(sinT, -1.0);
+				sinT = min(sinT,  1.0);
+				cosT = max(cosT, -1.0);
+				cosT = min(cosT,  1.0);
+				float a_s = asin(sinT);
+				float a_c = acos(cosT);
+				float theta = (a_s >= 0.0) ? a_c : (PI2 - a_c);
+
+				vec2 uv = vec2((theta / PI2) + 0.25, (phi / PI) + 0.5);
+				if (uv.x < 0.0) uv.x += 1.0;
+				if (uv.x > 1.0) uv.x -= 1.0;
+				return uv;
+			}
+
+			/**
+			 * Calculate UV at Panorama 180 from specified world coordinate position.
+			 * @param[in] centerPos  center position.
+			 * @param[in] wPos       world position.
+			 * @return UV value at 180 degree panorama (stereo) (x < 0.5 : left eye, x >= 0.5 : right eye).
+			 */
+			vec2 calcWorldPosToUV (vec3 centerPos, vec3 wPos, int leftEye) {
+				vec2 retUV = calcWPosToUV(wPos, centerPos, leftEye);
+				retUV = calcUV(retUV, leftEye);
+				return retUV;
+			}
+
+			/**
+			 * Get depth.
+			 */
+			float getDepth (sampler2D depthTex, vec2 uv) {
+				vec2 uv2 = uv;
+				uv2.x = (floor(uv2.x * _DepthTextureWidth) + 0.5) / _DepthTextureWidth;
+				uv2.y = (floor(uv2.y * _DepthTextureHeight) + 0.5) / _DepthTextureHeight;
+				float depth = texture2D(depthTex, uv2).r;
+				return depth;
+			}
+
+			/**
+			 * Calculate colliding world coordinate position from UV position and direction vector.
+			 * @param[in] depthTex  depth texture.
+			 * @param[in] uv        UV (x < 0.5 : left eye, x >= 0.5 : right eye).
+			 * @param[in] cPos      Center of the camera in world coordinates.
+			 * @param[in] vDir      gaze vector.
+			 */
+			vec3 calcUVToWorldPos (sampler2D depthTex, vec2 uv, vec3 cPos, vec3 vDir) {
+				float depth = getDepth(depthTex, uv);
+
+				// Convert from depth value to distance from camera.
+				depth = (depth >= 0.99999) ? _CameraFarPlane : (_CameraNearPlane / (1.0 - depth));
+				depth = min(depth, _CameraFarPlane);
+
+				return (vDir * depth) + cPos;
+			}
+
+			/**
+			 * _Pos1, _Pos2からvDir方向に伸ばしたZ距離zDist1,zDist2を指定し、_BlendVの位置での色を計算.
+			 * @param[in] zDist1  _Pos1からvDir方向に伸ばした交点までの距離.
+			 * @param[in] zDist2  _Pos2からvDir方向に伸ばした交点までの距離.
+			 * @param[in] wPosC0  _Pos1 - _Pos2の間の_BlendVの割合の位置.
+			 * @param[in] vDir    Target gaze vector.
+			 * @param[in] forceStore  True to force the color to be stored even if processing fails.			 
+			 * @return Color at intersection. Processing fails if x < 0.0.
+			 */
+			vec4 estimateColor (float zDist1, float zDist2, vec3 wPosC0, vec3 vDir, bool forceStore, int leftEye)  {
+				// Convert depth to world coordinates.
+				vec3 wPos1_b = (vDir * zDist1) + _Pos1.xyz;
+				vec3 wPos2_b = (vDir * zDist2) + _Pos2.xyz;
+
+				vec3 wPosC = mix(wPos1_b, wPos2_b, _BlendV);
+
+				// _Pos1が中心のパノラマはwPos1。これがwPosCに移動するときのUVを計算.
+				vec2 newUV1 = calcWorldPosToUV(_Pos1.xyz, wPosC, leftEye);
+				vec2 newUV2 = calcWorldPosToUV(_Pos2.xyz, wPosC, leftEye);
+
+				// UV値より、それぞれのワールド座標位置を計算.
+				vec3 wPosA = calcUVToWorldPos(_TexDepth1, newUV1, _Pos1.xyz, normalize(wPosC - _Pos1.xyz));
+				vec3 wPosB = calcUVToWorldPos(_TexDepth2, newUV2, _Pos2.xyz, normalize(wPosC - _Pos2.xyz));
+
+				float angle1 = dot(normalize(wPosA - wPosC0), vDir);
+				float angle2 = dot(normalize(wPosB - wPosC0), vDir);
+				vec4 col1 = texture2D(_Tex1, newUV1);
+				vec4 col2 = texture2D(_Tex2, newUV2);
+
+				vec4 col = vec4(-1, 0, 0, 1);
+				if (angle1 > F_ONE_MIN && angle2 > F_ONE_MIN) {
+					col = mix(col1, col2, _BlendV);
+				} else if (angle1 > F_ONE_MIN) {
+					col = col1;
+				} else if (angle2 > F_ONE_MIN) {
+					col = col2;
+				} else if (forceStore) {
+					col = mix(col1, col2, _BlendV);
+				}
+				return col;
+			}
+
+			void main()	{
+				vec2 uv = vUv;
+
+				// Right eye if uv.x is greater than 0.5.
+				int leftEye = 1;
+				if (uv.x >= 0.5) {
+					leftEye = 0;
+					uv.x -= 0.5;
+				}
+				vec2 uv0 = vec2(uv.x, uv.y); 
+
+				vec4 col = vec4(0.5, 0.0, 0.0, 1.0);
+
+				// Calculate UV value.
+				uv = calcUV(uv, leftEye);
+
+				if (_BlendV == 0.0 && _ShowDepth == 0) {
+					col = texture2D(_Tex1, uv);
+					col.xyz *= _Intensity;
+					gl_FragColor = vec4(col.xyz, 1.0);
+					return;
+				}
+
+				// When not performing spatial interpolation.
+				if (_SpatialInterpolation == 0) {
+					vec4 col1 = texture2D(_Tex1, uv);
+					vec4 col2 = texture2D(_Tex2, uv);
+					vec4 col = mix(col1, col2, _BlendV);
+					col.xyz *= _Intensity;
+					gl_FragColor = vec4(col.xyz, 1.0);
+					return;
+				}
+				
+				// Gaze vector.
+				vec3 vDir = calcVDir(uv0);
+
+				//---------------------------------------------------------------.
+				// 線形にdepth1-depth2に変化する場合は、この間で線形補間するだけ.
+				//---------------------------------------------------------------.
+				// ワールド座標上で、wPosC0からvDir方向に伸ばした直線上に最終的な交差位置が存在する.
+				vec3 wPosC0 = mix(_Pos1.xyz, _Pos2.xyz, _BlendV);
+
+				float depth1 = getDepth(_TexDepth1, uv);
+				float depth2 = getDepth(_TexDepth2, uv);
+
+				// Display depth.
+				if (_ShowDepth == 1) {
+					float vv1 = (depth1 >= F_ONE_MIN) ? _CameraFarPlane : (_CameraNearPlane / (1.0 - depth1));
+					float vv2 = (depth2 >= F_ONE_MIN) ? _CameraFarPlane : (_CameraNearPlane / (1.0 - depth2));
+					float vv = mix(vv1, vv2, _BlendV);
+					float maxDist = 5.0;
+					vv = (vv - _CameraNearPlane) / maxDist;
+					gl_FragColor = vec4(vv, vv, vv, 1.0);
+					return;
+				}
+
+				// depthをビュー座標上の距離に変換.
+				depth1 = (depth1 >= F_ONE_MIN) ? _CameraFarPlane : (_CameraNearPlane / (1.0 - depth1));
+				depth2 = (depth2 >= F_ONE_MIN) ? _CameraFarPlane : (_CameraNearPlane / (1.0 - depth2));
+				depth1 = min(depth1, _CameraFarPlane);
+				depth2 = min(depth2, _CameraFarPlane);
+
+				float depth1_b = depth1;
+				float depth2_b = depth2;
+				float minDepth = min(depth1_b, depth2_b);
+				float maxDepth = max(depth1_b, depth2_b);
+
+				col = estimateColor(depth1_b, depth2_b, wPosC0, vDir, false, leftEye);
+				if (col.x < 0.0) {
+					//col = vec4(1, 0, 0, 1);
+					col = estimateColor(minDepth, minDepth, wPosC0, vDir, false, leftEye);
+					if (col.x < 0.0) {
+						col = estimateColor(maxDepth, maxDepth, wPosC0, vDir, false, leftEye);
+						if (col.x < 0.0) {
+							col = estimateColor(depth1_b, depth2_b, wPosC0, vDir, true, leftEye);
+						}
+					}
+				}
+
+				col.xyz *= _Intensity;
+				gl_FragColor = vec4(col.xyz, 1.0);
+			}
+		</script>
+
+		<!-- --------------------------------- -->
+		<!-- main                              -->
+		<!-- --------------------------------- -->
+		<script>
+			var camera, scene, renderer;
+
+			var m_imageURL = "images/room/capture";					// Background texture URL.
+			var m_depthImageURL = "images/room/depth/capture";		// Background depth texture URL.
+
+			var m_texture2DList = null;								// textures list (RGB).
+			var m_texture2DDepthRTList = null;						// RenderTarget list (Depth).
+
+			var m_samplingCount = 24;								// Sampling count.
+			var m_completeTexturesLoading = false;					// Textures loading is complete.
+			var m_textureDepthWidth = 0;							// Depth texture width.
+			var m_textureDepthHeight = 0;							// Depth texture height.
+
+			var m_glTFURL = "objects/halfSphere_vr180.glb";		//backgroundSphere_vr360.glb";
+			var m_glTFObject = null;
+
+			var m_depthBlurMaterial = null;				// Depth blur material.
+			var m_panoramaSphereMaterial = null;		// Panorama sphere material.
+
+			var m_messageTextList = null; 			// Message list.
+
+			// Parameters.
+			var m_intensity = 1.3;			// Background Intensity.
+			var m_startPos = new THREE.Vector3(6.096, 6.344, 8.658);	// Start position. Unity coordinate (left hand).
+			var m_endPos   = new THREE.Vector3(5.103, 6.344, 6.616);	// End position. Unity coordinate (left hand).
+			var m_rotationY = -102.521;		// Y axis rotation. Unity coordinate (left hand).
+
+			var m_samplingPosList = null;			// Sampling position list.
+
+			var m_firstF = true;
+			var m_basePos = new THREE.Vector3(0.0, 1.6, 0.0);			// Base camera position.
+			var m_prevPos = null;
+			var m_curP = 4;                 // Current reference index of sampling.
+			var m_curBlend = 0.0;			// Blend value of current 2 textures.
+
+			var m_prevTimeSec = 0.0;		// For time measurement.
+
+			// Rendering elements for blurring depth textures.
+			var m_bufferScene = null;
+			var m_bufferCamera = null;
+			var m_bufferTexture = null;
+			var m_bufferPlaneMesh = null;
+
+			// VR hand controller.
+			var m_controller1 = null;
+
+			init();
+			animate();
+
+			/**
+			 * Get parameters from URL argument.
+			 */
+			function parseURL (urlStr) {
+				m_intensity = 1.0;
+
+				urlStr = urlStr.toLowerCase();
+				var strA = urlStr.split('&');
+				for (var i = 0; i < strA.length; ++i) {
+					var str2 = strA[i].split('=');
+					if (str2.length == 2) {
+						if (str2[1] == '') continue;
+						if (str2[0] == 'intensity') {
+							m_intensity = parseFloat(str2[1]);
+						}
+					}
+				}
+			}
+
+			function init () {
+				var container = document.getElementById( 'container' );
+
+				// Get parameters from URL argument (Example : intensity=1.2).
+				var url = location.search.substring(1);
+				parseURL(url);
+
+				// Camera is fixed at (0, 0, 0) in VR.
+				camera = new THREE.PerspectiveCamera( 75, window.innerWidth / window.innerHeight, 1, 2000 );
+				camera.layers.enable( 1 ); // render left view when no stereo available
+				camera.position.set(0, 0, 0);
+				camera.lookAt(0, 0, -1.0);
+
+				scene = new THREE.Scene();
+				scene.background = new THREE.Color(0x000000);
+
+				// Show messages.
+				appendMessage("After all the textures have been loaded, please press the \"ENTER VR\" button.");
+				appendMessage("You can move to the left front on the VR !");
+				appendMessage("Press the right controller button to display Depth.");
+				appendMessage("");
+
+				// Load materials.
+				loadMaterials();
+
+				// Load textures.
+				createTexture2DList();
+
+				// Load hemispheric glTF shape.
+				loadGLTF(m_glTFURL);
+
+				renderer = new THREE.WebGLRenderer({ antialias: true });
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.vr.enabled = true;
+				container.appendChild( renderer.domElement );
+
+				document.body.appendChild( WEBVR.createButton( renderer, { frameOfReferenceType: 'head-model' } ) );
+				window.addEventListener( 'resize', onWindowResize, false );
+
+				// Attach VR Hand Controller.
+				function onSelectStart () {
+					this.userData.isSelecting = true;
+				}
+				function onSelectEnd () {
+					this.userData.isSelecting = false;
+				}
+
+				m_controller1 = renderer.vr.getController( 0 );
+				m_controller1.addEventListener( 'selectstart', onSelectStart );
+				m_controller1.addEventListener( 'selectend', onSelectEnd );
+				scene.add( m_controller1 );
+			}
+
+			function onWindowResize () {
+				var width  = window.innerWidth;
+				var height = window.innerHeight;
+
+				camera.aspect = width / height;
+				camera.updateProjectionMatrix();
+				renderer.setSize( width, height );
+			}
+
+			function animate () {
+				renderer.setAnimationLoop( render );
+			}
+
+			function render () {
+				// Update background texture.
+				updateBackgroundTexture();
+
+				renderer.render( scene, camera );
+			}
+
+			/**
+			 * Create scenes, cameras and RenderTargets for Depth blur.
+			 */
+			function initFilterDepth (depthWidth, depthHeight) {
+				var width   = depthWidth;
+				var height  = depthHeight;
+				var widthH  = width  * 0.5;
+				var heightH = height * 0.5;
+
+				// Use orthographic projection for depth.
+				m_bufferScene = new THREE.Scene();
+				m_bufferScene.background = new THREE.Color(0xc00000);
+				m_bufferCamera = new THREE.OrthographicCamera(-widthH, widthH, heightH, -heightH, 0.1, 100);
+				m_bufferCamera.lookAt(0, 0, -1);
+				m_bufferCamera.position.z = 10.0;
+
+				var geom = new THREE.PlaneBufferGeometry(width, height);
+				m_bufferPlaneMesh = new THREE.Mesh( geom, m_depthBlurMaterial );
+				m_bufferScene.add(m_bufferPlaneMesh);
+
+				m_bufferCamera.aspect = width / height;
+				m_bufferCamera.updateProjectionMatrix();
+
+				// Create RenderTargets.
+				for (var i = 0; i < m_samplingCount; ++i) {
+					var rTarget = new THREE.WebGLRenderTarget(m_textureDepthWidth, m_textureDepthHeight, { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, type: THREE.FloatType });
+					rTarget.texture.generateMipmaps = false;
+					m_texture2DDepthRTList[i] = rTarget;
+				}
+			}
+
+			/**
+			 * Post-effect the depth textures.
+			 * @param[in] index    texture index.
+			 * @param[in] texture  source texture.
+			 */
+			function blurDepthTexture (index, texture) {
+				renderer.vr.enabled = false;		// This is required for post effects to texture.
+				renderer.autoClear = false;
+				renderer.setSize(m_textureDepthWidth, m_textureDepthHeight);
+				
+				var rTarget = m_texture2DDepthRTList[index];
+
+				m_depthBlurMaterial.uniforms['_MainTex'].value = texture;
+				m_depthBlurMaterial.uniforms['_TextureWidth'].value = parseFloat(m_textureDepthWidth);
+				m_depthBlurMaterial.uniforms['_TextureHeight'].value = parseFloat(m_textureDepthHeight);
+
+				renderer.setRenderTarget(rTarget);
+				renderer.clear();
+				renderer.render(m_bufferScene, m_bufferCamera);
+
+				// Restore WebGLRenderer.
+				renderer.setRenderTarget(null);
+				renderer.vr.enabled = true;
+				renderer.autoClear = true;
+				renderer.setSize( window.innerWidth, window.innerHeight );
+			}
+
+			/**
+			 * Load materials.
+			 */
+			function loadMaterials () {
+				{
+					m_depthBlurMaterial = new THREE.ShaderMaterial( {
+						uniforms: {
+							"_MainTex": {value: null},
+							"_TextureWidth": {value: 1024.0},
+							"_TextureHeight": {value: 512.0}
+						},
+						vertexShader: document.getElementById( 'vs-depth-blur' ).textContent,
+						fragmentShader: document.getElementById( 'fs-depth-blur' ).textContent
+					} );
+					if (m_depthBlurMaterial != null) {
+						appendMessage("Create shader material (depth-blur).");
+					}
+				}
+			}
+
+			/**
+			 * Load textures.
+			 */
+			function createTexture2DList () {
+				m_texture2DList = [];
+				m_texture2DDepthRTList = [];
+				for (var i = 0; i < m_samplingCount; ++i) {
+					m_texture2DList.push(null);
+					m_texture2DDepthRTList.push(null);
+				}
+
+				// Load textures sequentially.
+				loadTextureRGB(0);
+			}
+
+			/**
+			 * Load textures sequentially.
+			 */
+			function loadTextureRGB (index) {
+				if (index >= m_texture2DList.length) return;
+				if (index == 0) {
+					m_prevTimeSec = performance.now() / 1000.0;		// sec.
+				}
+
+				// Loading panoramic image.
+				var texture = new THREE.Texture();
+				texture.generateMipmaps = true;
+				texture.minFilter = THREE.LinearFilter;		//THREE.NearestFilter;
+				texture.maxFilter = THREE.LinearFilter;		//THREE.NearestFilter;
+				texture.format = THREE.RGBFormat;
+				var image = new Image();
+				image.onload = function () {
+					texture.image = this;
+					texture.needsUpdate = true;
+					m_texture2DList[index] = texture;
+					if (index + 1 < m_texture2DList.length) {
+						loadTextureRGB(index + 1);
+					} else if (index + 1 == m_texture2DList.length) {
+						var diffTimSec = (performance.now() / 1000.0) - m_prevTimeSec;
+						appendMessage("Success RGB images (" + diffTimSec.toString() + " sec).");
+						loadTextureDepth(0);	// Load depth textures sequentially.
+					}
+				};
+				image.src = m_imageURL + "_" + parseInt(index) + ".jpg";
+			}
+
+			/**
+			 * Load depth textures sequentially (hdr).
+			 */
+			 function loadTextureDepth (index) {
+				if (index >= m_texture2DList.length) return;
+				if (index == 0) {
+					m_prevTimeSec = performance.now() / 1000.0;		// sec.
+				}
+
+				// Loading panoramic depth image.
+				// Note : Use hdr because exr is slow in texture generation.
+				var url = m_depthImageURL + "_" + parseInt(index) + ".hdr";
+				var loader = new THREE.RGBELoader();
+				loader.load(url, function ( texture, textureData ) {
+					texture.minFilter = THREE.NearestFilter;
+					texture.magFilter = THREE.NearestFilter;
+					texture.generateMipmaps = false;
+					texture.encoding = THREE.RGBEEncoding;	// Required for hdr.
+					texture.flipY = true;					// Required for hdr.
+					texture.needsUpdate = true;
+
+					if (m_textureDepthWidth == 0) {
+						m_textureDepthWidth  = texture.image.width;
+						m_textureDepthHeight = texture.image.height;
+
+						// Initialization to filter depth.
+						initFilterDepth(m_textureDepthWidth, m_textureDepthHeight);
+					}
+
+					// pre-render depth texture.
+					blurDepthTexture(index, texture);
+					texture.dispose();
+
+					if (index + 1 < m_texture2DList.length) {
+						loadTextureDepth(index + 1);
+					} else {
+						// Preload textures (To load on GPU cache).
+						preLoadTextures();
+
+						m_completeTexturesLoading = true;
+
+						var diffTimSec = (performance.now() / 1000.0) - m_prevTimeSec;
+						appendMessage("Success Depth images (" + diffTimSec.toString() + " sec).");
+					}
+				});
+			}
+
+			/**
+			 * Load glTF file (background hemisphere).
+			 */
+			function loadGLTF (url) {
+				var loader = new THREE.GLTFLoader();
+				loader.load(url, function ( gltf ) {
+					m_glTFObject = gltf.scene;
+					setupBackgroundSphere();
+				} );
+			}
+
+			/**
+			 * Create background sphere.
+			 */
+			function setupBackgroundSphere () {
+				var scale = 100.0;				// Background radius.
+
+				// Load a Shader and create a material.
+				m_panoramaSphereMaterial = new THREE.ShaderMaterial( {
+					uniforms: {
+						"_Tex1": {value: null},
+						"_Tex2": {value: null},
+						"_TexDepth1": {value: null},
+						"_TexDepth2": {value: null},
+						"_Intensity": {value: m_intensity},
+						"_BasePos": {value: new THREE.Vector3(0, 0, 0)},
+						"_PrevPos": {value: new THREE.Vector3(0, 0, 0)},
+						"_CurrentPos": {value: new THREE.Vector3(0, 0, 0)},
+						"_Pos1": {value: new THREE.Vector4(0, 0, 0, 1)},
+						"_Pos2": {value: new THREE.Vector4(0, 0, 0, 1)},
+						"_BlendV": {value: 0.0},
+						"_DepthTextureWidth": {value: 2048.0},
+						"_DepthTextureHeight": {value: 1024.0},
+						"_SpatialInterpolation": {value: 1},
+						"_ShowDepth": {value: 0},
+						"_CameraNearPlane": {value: 0.1},
+						"_CameraFarPlane": {value: 100.0}
+					},
+					vertexShader: document.getElementById( 'vs-panoramaSphereRendering' ).textContent,
+					fragmentShader: document.getElementById( 'fs-panoramaSphereRendering' ).textContent
+				} );
+
+				// Left.
+				{
+					// Copy the geometry of the node where Material exists from the glTF hierarchy.
+					var geom = null;
+					m_glTFObject.traverse( function( node ) {
+						if (node.material) {
+							geom = node.geometry.clone();
+						}
+					} );
+
+					var mesh = new THREE.Mesh( geom, m_panoramaSphereMaterial );
+
+					mesh.scale.set(scale, scale * -1.0, scale);
+					mesh.material.needsUpdate = true;
+
+					mesh.layers.set( 1 ); // display in left eye only
+					scene.add( mesh );
+				}
+
+				// Right.
+				{
+					// Copy the geometry of the node where Material exists from the glTF hierarchy.
+					var geom = null;
+					m_glTFObject.traverse( function( node ) {
+						if (node.material) {
+							geom = node.geometry.clone();
+						}
+					} );
+
+					var mesh = new THREE.Mesh( geom, m_panoramaSphereMaterial );
+
+					mesh.scale.set(scale, scale * -1.0, scale);
+					mesh.material.needsUpdate = true;
+
+					var uvs = mesh.geometry.attributes.uv.array;
+					for (var i = 0; i < uvs.length; i += 2) {
+						uvs[i] += 0.5;
+					}
+
+					mesh.layers.set( 2 ); // display in right eye only
+					scene.add( mesh );
+				}
+
+				appendMessage("Success create background sphere.");
+			}
+
+			/**
+			 * Preload textures.
+			 * (To load on GPU cache).
+			 */
+			function preLoadTextures () {
+				if (m_texture2DList == null || m_bufferScene == null) return;
+
+				var material = new THREE.MeshBasicMaterial();
+				var oldMaterial = m_bufferPlaneMesh.material;
+				m_bufferPlaneMesh.material = material;
+				m_bufferPlaneMesh.material.needsUpdate = true;
+
+				var rTarget = new THREE.WebGLRenderTarget(m_textureDepthWidth, m_textureDepthHeight, { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, type: THREE.FloatType });
+				rTarget.texture.generateMipmaps = false;
+
+				renderer.vr.enabled = false;
+				renderer.autoClear = false;
+				renderer.setSize(m_textureDepthWidth, m_textureDepthHeight);
+
+				for (var i = 0; i < m_texture2DList.length; ++i) {
+					var texture = m_texture2DList[i];
+					if (texture == null) continue;
+
+					material.map = texture;
+					material.map.needsUpdate = true;
+
+					renderer.setRenderTarget(rTarget);
+					renderer.clear();
+					renderer.render(m_bufferScene, m_bufferCamera);
+				}
+
+				m_bufferPlaneMesh.material = oldMaterial;
+				rTarget.dispose();
+				material.dispose();
+
+				// Restore WebGLRenderer.
+				renderer.setRenderTarget(null);
+				renderer.vr.enabled = true;
+				renderer.autoClear = true;
+				renderer.setSize( window.innerWidth, window.innerHeight );
+			}
+
+			/**
+			 * Update background texture.
+			 */
+			function updateBackgroundTexture () {
+				if (!m_completeTexturesLoading) {
+					// Pass the panoramic image to Shader.
+					if (m_panoramaSphereMaterial != null && m_texture2DList != null) {
+						if (m_texture2DList[0] != null) {
+							m_panoramaSphereMaterial.uniforms['_Tex1'].value = m_texture2DList[0];
+							m_panoramaSphereMaterial.uniforms['_Tex2'].value = m_texture2DList[0];
+							m_panoramaSphereMaterial.uniforms['_BlendV'].value = 0.0;
+							m_panoramaSphereMaterial.uniforms['_ShowDepth'].value = 0;
+							m_panoramaSphereMaterial.needsUpdate = true;
+						}
+					}
+					return;
+				}
+
+				if (m_firstF) {
+					m_basePos = m_prevPos = camera.position.clone();
+					m_firstF = false;
+					appendMessage("First camera pos (" + m_basePos.x.toString() + ", " + m_basePos.y.toString() + ", " + m_basePos.z.toString() + ")");
+
+					// Original rotation matrix.
+					var rotYMat = (new THREE.Matrix4()).makeRotationY(-m_rotationY * Math.PI / 180.0);
+
+					// Convert start/end position.
+					var dist = m_startPos.distanceTo(m_endPos);
+					var dd = m_endPos.clone().sub(m_startPos).applyMatrix4(rotYMat);
+					dd.z = -dd.z;			// Convert Unity(left hand) to WebGL(right hand).
+					m_endPos   = dd.add(m_basePos);
+					m_startPos = m_basePos.clone();
+
+					// Calculate sampling position.
+					m_samplingPosList = [];
+					var ddP  = m_endPos.clone().sub(m_startPos).divideScalar(parseFloat(m_samplingCount - 1));
+					var wPos = m_startPos.clone();
+					for (var i = 0; i < m_samplingCount; ++i) {
+						m_samplingPosList.push(wPos.clone());
+						wPos.add(ddP);
+					}
+
+					var basePos2 = m_samplingPosList[m_curP].clone();
+					for (var i = 0; i < m_samplingCount; ++i) {
+						m_samplingPosList[i] = m_samplingPosList[i].clone().sub(basePos2).add(m_basePos);
+					}
+				}
+				if (m_samplingPosList == null) return;
+				var curCameraPos = camera.position.clone();
+
+				var minPos = -1;
+				var minBlend = 0.0;
+				var minADist = -1.0;
+
+				var maxAltitudeDist = 2.0;
+				for (var i = 0; i < m_samplingCount - 1; ++i) {
+					var p1 = m_samplingPosList[i];
+					var p2 = m_samplingPosList[i + 1];
+
+					// Calculate the straight line position of p1-p2 and the perpendicular position made by curCameraPos.
+					var retData = {position: 0.0, distance: 0.0};
+					if (!MathUtil.calcPerpendicular(p1, p2, curCameraPos, retData)) continue;
+					var aPos  = retData['position'];
+					var aDist = retData['distance'];
+					if (aPos < 0.0 || aPos > 1.0) continue;
+					if (aDist > maxAltitudeDist) continue;
+					if (minPos < 0 || minADist > aDist) {
+						minPos = i;
+						minBlend = aPos;
+						minADist = aDist;
+					}
+				}
+
+				if (minPos >= 0) {
+					m_curP     = minPos;
+					m_curBlend = minBlend;
+				}
+
+				// Sampling position.
+				var pos1 = (m_samplingPosList != null) ? m_samplingPosList[m_curP] : new THREE.Vector3(0, 0, 0);
+				var pos2 = (m_samplingPosList != null) ? m_samplingPosList[m_curP + 1] : new THREE.Vector3(0, 0, 0);
+				m_panoramaSphereMaterial.uniforms['_Pos1'].value = new THREE.Vector4(pos1.x, pos1.y, pos1.z, 1.0);
+				m_panoramaSphereMaterial.uniforms['_Pos2'].value = new THREE.Vector4(pos2.x, pos2.y, pos2.z, 1.0);
+
+				m_prevPos = curCameraPos.clone();
+
+				m_panoramaSphereMaterial.uniforms['_Tex1'].value = m_texture2DList[m_curP];
+				m_panoramaSphereMaterial.uniforms['_Tex2'].value = m_texture2DList[m_curP + 1];
+				m_panoramaSphereMaterial.uniforms['_TexDepth1'].value = m_texture2DDepthRTList[m_curP].texture;
+				m_panoramaSphereMaterial.uniforms['_TexDepth2'].value = m_texture2DDepthRTList[m_curP + 1].texture;
+				m_panoramaSphereMaterial.uniforms['_BlendV'].value = m_curBlend;
+				m_panoramaSphereMaterial.uniforms['_Intensity'].value = m_intensity;
+				m_panoramaSphereMaterial.uniforms['_CameraNearPlane'].value = 0.1;
+				m_panoramaSphereMaterial.uniforms['_CameraFarPlane'].value = 100.0;
+
+				m_panoramaSphereMaterial.uniforms['_DepthTextureWidth'].value = parseFloat(m_textureDepthWidth);
+				m_panoramaSphereMaterial.uniforms['_DepthTextureHeight'].value = parseFloat(m_textureDepthHeight);
+				m_panoramaSphereMaterial.uniforms['_SpatialInterpolation'].value = 1;
+				m_panoramaSphereMaterial.uniforms['_ShowDepth'].value = (m_controller1.userData.isSelecting) ? 1 : 0;
+
+				m_panoramaSphereMaterial.needsUpdate = true;
+			}
+			
+			/**
+			 * show debug message.
+			 */
+			function appendMessage (messageStr) {
+				if (m_messageTextList == null) {
+					m_messageTextList = [];
+				}
+				m_messageTextList.push(messageStr);
+				while (m_messageTextList.length > 20) {
+					m_messageTextList.shift();
+				}
+				var htmlStr = "";
+				for (var i = 0; i < m_messageTextList.length; ++i) {
+					htmlStr += m_messageTextList[i];
+					if (i + 1 < m_messageTextList.length) {
+						htmlStr += "<br>\n";
+					}
+				}
+
+				var infoC = document.getElementById('info');
+				infoC.innerHTML = htmlStr;
+			}			
+		</script>
+	</body>
+</html>
+
